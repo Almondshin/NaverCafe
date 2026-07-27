@@ -22,8 +22,12 @@
 | 파이썬 | **Python 3.7 이상** — <https://www.python.org/downloads/> |
 | 계정 | 해당 카페 게시판을 **읽을 수 있는 등급의 네이버 계정** |
 
-> 윈도우에서 파이썬을 설치할 때, 설치 첫 화면의
-> **`Add python.exe to PATH`** 체크박스를 반드시 켜 주세요.
+> **윈도우**: 파이썬 설치 첫 화면의 **`Add python.exe to PATH`** 체크박스를 반드시 켜 주세요.
+> 명령어는 `python` 입니다.
+>
+> **macOS / 리눅스**: 명령어는 **`python3`** 입니다. `python` 은 없습니다
+> (`zsh: command not found: python`). macOS 에 파이썬이 없다면
+> `xcode-select --install` 또는 `brew install python3` 으로 설치하세요.
 
 ---
 
@@ -48,18 +52,28 @@ chmod +x download.sh      # 처음 한 번만
 
 ### 명령줄에서 바로
 
+> 아래 예시는 **macOS / 리눅스** 기준(`python3`)입니다.
+> **윈도우**에서는 `python3` 을 `python` 으로 바꿔 주세요. (`py -3` 도 됩니다)
+
 ```bash
 # 게시판 전체
-python naver_cafe_dl.py "https://cafe.naver.com/f-e/cafes/16075980/menus/194?viewType=L"
+python3 naver_cafe_dl.py "https://cafe.naver.com/f-e/cafes/16075980/menus/194?viewType=L"
 
 # 게시글 하나
-python naver_cafe_dl.py "https://cafe.naver.com/f-e/cafes/16075980/articles/407624"
+python3 naver_cafe_dl.py "https://cafe.naver.com/f-e/cafes/16075980/articles/407624"
 
-# 다운로드 없이 어떤 글에 어떤 화질이 있는지 확인만
-python naver_cafe_dl.py "<게시판URL>" --list
+# 다운로드 없이 어떤 글에 어떤 화질이 있는지 확인만 (최근 3개)
+python3 naver_cafe_dl.py "<게시판URL>" --list --limit 3
 
 # 최근 5개만, 720p 로, 다른 폴더에
-python naver_cafe_dl.py "<게시판URL>" --limit 5 --quality 720 -o "D:\영문법"
+python3 naver_cafe_dl.py "<게시판URL>" --limit 5 --quality 720 -o ~/Movies/영문법
+```
+
+`download.sh` / `download.bat` 는 `python3` · `python` · `py -3` 중 있는 것을 알아서
+찾아 주므로, 어느 쪽인지 신경 쓰기 싫으면 이걸 쓰세요.
+
+```bash
+./download.sh "<게시판URL>" --list --limit 3
 ```
 
 ---

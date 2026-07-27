@@ -1158,6 +1158,7 @@ class Stats:
         self.skipped = 0
         self.failed = 0
         self.no_video = 0
+        self.listed = 0      # --list 모드에서 확인만 한 영상 수
 
 
 def process_article(cafe_id: str, article_id: str, subject_hint: str,
@@ -1229,7 +1230,7 @@ def process_article(cafe_id: str, article_id: str, subject_hint: str,
             f" → {os.path.basename(target)}")
 
         if args.list_only:
-            stats.skipped += 1
+            stats.listed += 1
             continue
 
         def refresh():
@@ -1354,10 +1355,15 @@ def main(argv=None) -> int:
 
     log("")
     log("=" * 68)
-    log(f" 완료  성공 {stats.ok} / 건너뜀 {stats.skipped} / 실패 {stats.failed} / 영상없음 {stats.no_video}"
-        f"   ({time.time() - started:.0f}초)")
+    if args.list_only:
+        log(f" 확인 완료  영상 {stats.listed}개 / 실패 {stats.failed} / 영상없음 {stats.no_video}"
+            f"   ({time.time() - started:.0f}초)")
+        log(" --list 모드라 실제 다운로드는 하지 않았습니다. --list 를 빼고 다시 실행하세요.")
+    else:
+        log(f" 완료  성공 {stats.ok} / 건너뜀 {stats.skipped} / 실패 {stats.failed}"
+            f" / 영상없음 {stats.no_video}   ({time.time() - started:.0f}초)")
     log("=" * 68)
-    return 1 if stats.failed and not stats.ok else 0
+    return 1 if stats.failed and not (stats.ok or stats.listed) else 0
 
 
 if __name__ == "__main__":
