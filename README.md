@@ -109,8 +109,10 @@ NID_SES=iJkL...
 | `-q`, `--quality` | `1080` / `720` / `480` / `best` / `worst` | `1080` |
 | `-c`, `--cookies` | 쿠키 파일 경로 | 스크립트 옆 `cookies.txt` |
 | `--pages` | 게시판 목록을 몇 페이지까지 읽을지 | `10` |
-| `--per-page` | 목록 한 페이지당 글 수 | `50` |
+| `--per-page` | 목록 한 페이지당 글 수 (최대 50) | `50` |
 | `--limit` | 최대 처리할 게시글 수 (`0` = 전부) | `0` |
+| `--strict-quality` | 원하는 화질이 없으면 낮은 화질로 받지 않고 건너뛰기 | 대체 다운로드 |
+| `--all-articles` | 목록의 '동영상 있음' 표시를 무시하고 모든 글을 열어보기 | 영상 있는 글만 |
 | `--oldest-first` | 오래된 글부터 처리 | 최신순 |
 | `--skip-notice` | 공지글 건너뛰기 | 포함 |
 | `--full-title` | 대괄호 대신 **제목 전체**를 파일명으로 | 대괄호 |
@@ -145,18 +147,31 @@ NID_SES=iJkL...
 ```
 게시판 URL
   └─ 목록 API   apis.naver.com/cafe-web/cafe-boardlist-api/v1/cafes/{카페}/menus/{메뉴}/articles
-       └─ 게시글 API apis.naver.com/cafe-web/cafe-articleapi/v3/cafes/{카페}/articles/{글번호}
-            ├─ subject      → 제목 → 대괄호 추출 → 파일 이름
-            └─ contentHtml  → <script class="__se_module_data" data-module='{"data":{"vid":..,"inkey":..}}'>
-                 └─ 재생정보 API  apis.naver.com/rmcnmv/rmcnmv/vod/play/v2.0/{vid}?key={inkey}
-                      ├─ JSON 응답  → videos.list[].source (encodingOption.height == 1080)
-                      └─ DASH(MPD) → <Representation id="PD_1080P_01" height="1080"><BaseURL>...mp4
-                           └─ 서명된 mp4 주소를 그대로 저장 (Range 이어받기 지원)
+       │           result.articleList[].item.{articleId, subject, hasMovie}
+       └─ 게시글 API article.cafe.naver.com/gw/v4/cafes/{카페}/articles/{글번호}
+            ├─ result.article.subject      → 대괄호 추출 → 파일 이름
+            └─ result.article.contentHtml  → <script class="__se_module_data"
+                 │                             data-module='{"type":"v2_video",
+                 │                              "data":{"vid":..,"inkey":..}}'>
+                 └─ 재생정보 API
+                      ├─ apis.naver.com/neonplayer/vodplay/v3/playback/{vid}?key={inkey}
+                      │     → DASH 매니페스트(XML)
+                      │       <Representation id="PD_1080P_01"><BaseURL>...mp4?_lsu_sa_=..
+                      └─ apis.naver.com/rmcnmv/rmcnmv/vod/play/v2.0/{vid}?key={inkey}
+                            → JSON: videos.list[].source
+                 └─ 서명된 mp4 주소를 그대로 저장 (Range 이어받기 지원)
 ```
 
-재생정보 API 는 JSON 으로 올 때도 있고 DASH 매니페스트(XML)로 올 때도 있어서
-**두 형태를 모두 처리**합니다. `PD_` 로 시작하는 항목은 영상+음성이 합쳐진
-완성된 mp4 라서 ffmpeg 없이 그대로 저장할 수 있습니다.
+- 현재 카페 플레이어는 **neonplayer(DASH)** 를 쓰고, 예전 **rmcnmv(JSON)** 도 아직 살아 있어서
+  **두 형태를 모두 처리**합니다. 판별은 URL 이 아니라 **응답 본문의 첫 글자**로 합니다.
+- `PD_` 로 시작하는 트랙은 **Progressive Download** — 영상+음성이 합쳐진 완성된 mp4 라서
+  ffmpeg 없이 그대로 저장됩니다. 분할(HLS) 트랙은 무시합니다.
+- 화질 숫자는 **짧은 변** 기준입니다. 세로 영상은 `width=1080 height=1920` 처럼 나오므로
+  `height` 로 정렬하지 않고 `PD_1080P_01` / `<Label kind="resolution">` 을 읽습니다.
+- CDN 주소의 `_lsu_sa_` 서명은 약 8시간 뒤 만료됩니다. 다운로드 도중 만료되면
+  재생정보를 다시 받아 **이어받기로 계속**합니다.
+- 영상 파일은 CDN 서명만으로 받으므로 **쿠키는 `*.naver.com` 에만 보내고
+  `pstatic.net` 에는 보내지 않습니다.**
 
 ---
 
@@ -168,8 +183,10 @@ NID_SES=iJkL...
 | `errorCode=0004` 인데 방금 복사했다 | `NID_AUT` 와 `NID_SES` 를 둘 다 넣었는지, 값 앞뒤에 공백이 섞이지 않았는지 확인하세요. |
 | `삭제되었거나 존재하지 않는 게시글입니다` | 글 번호가 잘못됐거나 삭제된 글입니다. |
 | `동영상이 없습니다` | 그 글에 카페 업로드 영상이 없습니다. (유튜브 링크는 대상이 아닙니다) |
-| `1080p 가 없어 720p 로 받습니다` | 업로더가 1080p 로 올리지 않은 영상입니다. `--list` 로 화질을 확인할 수 있습니다. |
-| `재생정보 오류` / 화질 없음 | 유료·DRM 영상이거나 재생 권한이 없는 경우입니다. |
+| `1080p 가 없어 720p 로 받습니다` | 업로더가 1080p 로 올리지 않은 영상입니다. `--list` 로 화질을 확인할 수 있습니다. 낮은 화질을 원치 않으면 `--strict-quality`. |
+| `호출 정보가 잘못되어 재생할 수 없습니다 (ACCESS_DENIED)` | vid/inkey 가 만료됐습니다. inkey 는 짧게 유효하므로 그냥 다시 실행하면 됩니다. |
+| `DRM/유료 보호 영상이라...` | 직접 받을 수 있는 PD 트랙이 없는 보호 콘텐츠입니다. |
+| 영상 있는 글을 건너뜀 | 목록의 '동영상 있음' 표시를 따릅니다. 표시가 잘못됐다면 `--all-articles`. |
 | `파이썬을 찾을 수 없습니다` | 파이썬 설치 시 `Add python.exe to PATH` 를 체크하지 않은 경우입니다. 다시 설치하세요. |
 | 한글이 깨짐 | `download.bat` 을 통해 실행하세요 (`chcp 65001` 로 UTF-8 을 켭니다). |
 | 중간에 멈춤 | 다시 실행하면 `.part` 파일부터 **이어받습니다.** |

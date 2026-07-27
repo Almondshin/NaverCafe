@@ -48,13 +48,15 @@ DEFAULT_OUTDIR = "downloads"
 CHUNK = 256 * 1024
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 게시글 본문 API (우선순위 순서대로 시도)
+# 게시글 본문 API (우선순위 순서대로 시도. v2 는 500 을 반환하므로 제외)
 ARTICLE_ENDPOINTS = (
+    "https://article.cafe.naver.com/gw/v4/cafes/{cafe}/articles/{art}"
+    "?useCafeId=true&requestFrom=A",
+    "https://apis.naver.com/cafe-web/cafe-articleapi/v4/cafes/{cafe}/articles/{art}"
+    "?useCafeId=true&requestFrom=A",
     "https://apis.naver.com/cafe-web/cafe-articleapi/v3/cafes/{cafe}/articles/{art}"
     "?query=&useCafeId=true&requestFrom=A",
     "https://apis.naver.com/cafe-web/cafe-articleapi/v2.1/cafes/{cafe}/articles/{art}"
-    "?query=&useCafeId=true&requestFrom=A",
-    "https://apis.naver.com/cafe-web/cafe-articleapi/v2/cafes/{cafe}/articles/{art}"
     "?query=&useCafeId=true&requestFrom=A",
 )
 
@@ -67,24 +69,18 @@ LIST_ENDPOINTS = (
     "&search.page={page}&search.perPage={size}&ad=false",
 )
 
-# 동영상 재생정보 API
+# 동영상 재생정보 API.
+#   현재 카페 플레이어는 neonplayer(DASH MPD)를 쓰고, 예전 rmcnmv(JSON)도 아직 살아 있습니다.
+#   URL 이 아니라 "응답의 첫 글자"로 형식을 판별합니다.
 PLAY_ENDPOINTS = (
-    "https://apis.naver.com/rmcnmv/rmcnmv/vod/play/v2.0/{vid}",
-    "https://play.rmcnmv.naver.com/vod/play/v2.0/{vid}",
+    ("https://apis.naver.com/neonplayer/vodplay/v3/playback/{vid}", "application/dash+xml"),
+    ("https://apis.naver.com/neonplayer/vodplay/v2/playback/{vid}", "application/dash+xml"),
+    ("https://apis.naver.com/rmcnmv/rmcnmv/vod/play/v2.0/{vid}", "application/json"),
+    ("http://play.rmcnmv.naver.com/vod/play/v2.0/{vid}", "application/json"),
 )
-PLAY_PARAMS_FULL = {
-    "sid": "2024",
-    "nonce": "",
-    "devt": "html5_pc",
-    "prv": "N",
-    "aup": "N",
-    "stpb": "N",
-    "cpl": "ko_KR",
-    "env": "real",
-    "lc": "ko_KR",
-    "adi": "[]",
-    "adu": "/",
-}
+PLAY_REFERER = "https://serviceapi.nmv.naver.com/"
+# 일부 서버가 400 을 낼 때만 덧붙이는 보조 파라미터
+PLAY_PARAMS_EXTRA = {"env": "real", "lc": "ko_KR", "cpl": "ko_KR"}
 
 # --------------------------------------------------------------------------- #
 # 출력 유틸
@@ -442,32 +438,62 @@ def deep_find_str(obj, keys, predicate=None, _depth=0):
     return None
 
 
-def deep_collect_articles(obj, out: list, seen: set, _depth=0) -> None:
-    """articleId + subject 를 가진 모든 노드를 순서대로 수집합니다."""
+def deep_collect_articles(obj, out: list, seen: set, row_type=None, _depth=0) -> None:
+    """articleId + subject 를 가진 모든 노드를 순서대로 수집합니다.
+
+    새 목록 API 는 {"type":"ARTICLE","item":{"articleId":..,"subject":..,"hasMovie":..}}
+    구조라서 바깥 노드의 type 을 안쪽으로 물려줍니다.
+    """
     if _depth > 12:
         return
     if isinstance(obj, dict):
+        kind = obj.get("type") if isinstance(obj.get("type"), str) else row_type
         aid = obj.get("articleId", obj.get("articleid"))
         subj = obj.get("subject", obj.get("articleTitle"))
         if aid is not None and isinstance(subj, str):
             sid = str(aid)
             if sid.isdigit() and sid not in seen:
                 seen.add(sid)
+                notice = bool(obj.get("noticeArticle") or obj.get("notice"))
+                if kind and kind != "ARTICLE":
+                    notice = True          # REQUIRED_NOTICE / MENU_NOTICE / UP_ARTICLE ...
                 out.append({
                     "article_id": sid,
                     "subject": html_mod.unescape(subj).strip(),
-                    "notice": bool(obj.get("noticeArticle") or obj.get("notice")),
+                    "notice": notice,
+                    # 목록 단계에서 영상 유무를 알 수 있으면 본문 조회를 건너뛸 수 있습니다.
+                    "has_movie": bool(obj.get("hasMovie") or obj.get("attachMovie")),
+                    "movie_flag_known": ("hasMovie" in obj or "attachMovie" in obj),
                 })
         for val in obj.values():
-            deep_collect_articles(val, out, seen, _depth + 1)
+            deep_collect_articles(val, out, seen, kind, _depth + 1)
     elif isinstance(obj, list):
         for item in obj:
-            deep_collect_articles(item, out, seen, _depth + 1)
+            deep_collect_articles(item, out, seen, row_type, _depth + 1)
 
 
 # --------------------------------------------------------------------------- #
 # 카페 API
 # --------------------------------------------------------------------------- #
+
+
+# 오류 코드 → 사람이 읽을 수 있는 설명 (reason 이 비어 있을 때만 사용)
+ERROR_HINTS = {
+    "0004": "로그인하지 않았습니다 (쿠키 만료).",
+    "0005": "비공개 카페입니다. 가입 후 이용하세요.",
+    "0010": "카페 번호(cafeId)가 잘못되었습니다. 숫자 ID 가 필요합니다.",
+    "2000": "게시판 등급 제한으로 읽을 수 없습니다.",
+    "3009": "읽기 권한이 없는 회원 등급입니다.",
+    "3030": "실명 확인이 필요한 게시글입니다.",
+    "3031": "성인 인증이 필요한 게시글입니다.",
+    "3032": "성인 인증이 필요한 게시글입니다.",
+    "4003": "삭제되었거나 존재하지 않는 게시글입니다.",
+    "4004": "읽기 권한이 없는 회원 등급입니다.",
+    "4005": "게시판 등급 제한으로 읽을 수 없습니다.",
+    "4007": "접근이 제한된 게시판입니다.",
+    "11005": "게시판(menuId)을 찾을 수 없습니다.",
+    "45005": "숨김 처리된 게시판입니다.",
+}
 
 
 def naver_error(payload) -> str | None:
@@ -491,7 +517,8 @@ def naver_error(payload) -> str | None:
     if reason:
         return f"{reason} (errorCode={code})" if code else str(reason)
     if code:
-        return f"errorCode={code}"
+        hint = ERROR_HINTS.get(str(code))
+        return f"{hint} (errorCode={code})" if hint else f"errorCode={code}"
     return None
 
 
@@ -601,11 +628,20 @@ def fetch_article_list(cafe_id: str, menu_id: str, cookies: dict,
 # 본문 HTML → 동영상 (vid, inkey)
 # --------------------------------------------------------------------------- #
 
-RE_DATA_MODULE = re.compile(r"data-module\s*=\s*(?:\"([^\"]*)\"|'([^']*)')", re.I)
-RE_VID = re.compile(r"[\"']?(?:vid|videoId|videoid)[\"']?\s*[:=]\s*[\"']([A-Za-z0-9_\-]{6,})[\"']")
-RE_INKEY = re.compile(r"[\"']?(?:inkey|inKey|in_key)[\"']?\s*[:=]\s*[\"']([^\"']{6,})[\"']")
+# 스마트에디터는 data-module / data-module-v2 두 가지 속성에 같은 JSON 을 넣습니다.
+RE_DATA_MODULE = re.compile(r"data-module(?:-v2)?\s*=\s*(?:\"([^\"]*)\"|'([^']*)')", re.I)
+# vid 와 inkey 는 가까이 붙어 있으므로 근접 매칭으로 짝을 맞춥니다.
+RE_PAIR = re.compile(
+    r"[\"']?vid[\"']?\s*[:=]\s*[\"']([A-Za-z0-9_\-]{8,})[\"']"
+    r"(?:(?![\"']?vid[\"']?\s*[:=])[\s\S]){0,500}?"
+    r"[\"']?in_?[kK]ey[\"']?\s*[:=]\s*[\"']([^\"']{8,})[\"']"
+)
 RE_ATTR_VID = re.compile(r"data-vid\s*=\s*[\"']([^\"']+)[\"']", re.I)
 RE_ATTR_INKEY = re.compile(r"data-in-?key\s*=\s*[\"']([^\"']+)[\"']", re.I)
+# 옛날 글에 남아 있는 임베드 형식 (속성 순서가 바뀌기도 합니다)
+RE_LEGACY_SPAN = re.compile(r"<span[^>]*_naverVideo[^>]*>", re.I)
+RE_ANY_VID = re.compile(r"\bvid\s*=\s*[\"']([^\"']+)[\"']", re.I)
+RE_ANY_KEY = re.compile(r"\b(?:in_?key|key)\s*=\s*[\"']([^\"']+)[\"']", re.I)
 
 
 def _pick(d: dict, *names):
@@ -622,8 +658,9 @@ def extract_videos(body_html: str) -> list:
     seen: set = set()
 
     def add(vid, inkey):
-        if vid and inkey and (vid, inkey) not in seen:
-            seen.add((vid, inkey))
+        # 같은 영상이 data-module 과 data-module-v2 양쪽에 들어 있으므로 vid 로 중복 제거
+        if vid and inkey and vid not in seen:
+            seen.add(vid)
             found.append({"vid": vid, "inkey": inkey})
 
     # 1) 스마트에디터 모듈 데이터 (가장 정확)
@@ -642,17 +679,19 @@ def extract_videos(body_html: str) -> list:
             _pick(data, "inkey", "inKey", "in_key", "key"))
 
     # 2) 속성 형태 (data-vid / data-inkey)
-    vids = RE_ATTR_VID.findall(body_html)
-    keys = RE_ATTR_INKEY.findall(body_html)
-    for vid, inkey in zip(vids, keys):
+    for vid, inkey in zip(RE_ATTR_VID.findall(body_html), RE_ATTR_INKEY.findall(body_html)):
         add(vid, inkey)
 
-    # 3) 최후의 보루: HTML 전체에서 vid/inkey 쌍을 순서대로 매칭
+    # 3) 옛날 임베드 <span class="_naverVideo" vid=".." key="..">
+    for tag in RE_LEGACY_SPAN.findall(body_html):
+        vid = RE_ANY_VID.search(tag)
+        key = RE_ANY_KEY.search(tag)
+        if vid and key:
+            add(vid.group(1), key.group(1))
+
+    # 4) 최후의 보루: HTML 전체에서 vid/inkey 를 근접 매칭
     if not found:
-        text = html_mod.unescape(body_html)
-        vids = RE_VID.findall(text)
-        keys = RE_INKEY.findall(text)
-        for vid, inkey in zip(vids, keys):
+        for vid, inkey in RE_PAIR.findall(html_mod.unescape(body_html)):
             add(vid, inkey)
 
     return found
@@ -663,8 +702,20 @@ def extract_videos(body_html: str) -> list:
 # --------------------------------------------------------------------------- #
 
 
-def _height_from_id(text: str) -> int:
-    m = re.search(r"(\d{3,4})[pP]", text or "")
+class DrmError(RuntimeError):
+    """DRM/유료 보호 영상 - 직접 받을 수 있는 트랙이 없음."""
+
+
+def _int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _quality_from_label(text: str) -> int:
+    """'1080P_01', '720p', 'PD_1080P_1920_8000_192' → 1080 / 720 / 1080"""
+    m = re.search(r"(\d{3,4})\s*[pP]", text or "")
     return int(m.group(1)) if m else 0
 
 
@@ -672,8 +723,14 @@ def _tag(el) -> str:
     return el.tag.split("}")[-1] if isinstance(el.tag, str) else ""
 
 
+def _candidate(quality: int, url: str, label: str, size: int = 0,
+               progressive: bool = True) -> dict:
+    return {"quality": quality, "url": url, "label": label or f"{quality}p",
+            "size": size, "progressive": progressive}
+
+
 def parse_play_json(data: dict) -> list:
-    """[{'height','url','label','size','progressive'}] 후보 목록."""
+    """예전 rmcnmv JSON 응답 → 후보 목록."""
     out: list = []
     for video in (dig(data, "videos", "list") or []):
         if not isinstance(video, dict):
@@ -683,158 +740,257 @@ def parse_play_json(data: dict) -> list:
             continue
         enc = video.get("encodingOption") or {}
         label = str(enc.get("id") or enc.get("name") or "")
-        try:
-            height = int(enc.get("height") or 0)
-        except (TypeError, ValueError):
-            height = 0
-        height = height or _height_from_id(label)
-        try:
-            size = int(video.get("size") or 0)
-        except (TypeError, ValueError):
-            size = 0
-        out.append({
-            "height": height,
-            "url": url,
-            "label": label or f"{height}p",
-            "size": size,
-            "progressive": True,
-        })
+        # 세로 영상은 width=480 height=854 처럼 나오므로 height 로 정렬하면 안 됩니다.
+        # 화질 숫자는 항상 "짧은 변" 기준입니다.
+        quality = _quality_from_label(label)
+        if not quality:
+            width, height = _int(enc.get("width")), _int(enc.get("height"))
+            quality = min(width, height) if width and height else (height or width)
+        out.append(_candidate(quality, url, label, _int(video.get("size"))))
     return out
 
 
-def parse_play_mpd(xml_text: str, manifest_url: str) -> list:
-    """네이버 DASH 매니페스트(nvod)에서 Representation 을 뽑습니다."""
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return []
-
-    # MPD / Period 레벨의 BaseURL (상대경로 대비)
+def _mpd_representations(root, manifest_url: str) -> tuple:
+    """(후보목록, DRM여부)"""
     prefix = manifest_url
     for el in root:
         if _tag(el) == "BaseURL" and (el.text or "").strip():
             prefix = urllib.parse.urljoin(manifest_url, el.text.strip())
             break
 
+    drm = any(_tag(el) == "ContentProtection" for el in root.iter())
+
     out: list = []
     for rep in root.iter():
         if _tag(rep) != "Representation":
             continue
-        base = None
+        rep_id = rep.get("id") or ""
+        mime = rep.get("mimeType") or ""
+
+        base = ""
         for child in rep:
             if _tag(child) == "BaseURL" and (child.text or "").strip():
                 base = child.text.strip()
                 break
         if not base:
+            continue                      # 분할 세그먼트 또는 DRM 트랙
+        if base.endswith("/") or base.rstrip("/").endswith("/hls"):
+            continue                      # 세그먼트 디렉터리 (HLS)
+        if "mp2t" in mime:
+            continue                      # HLS(TS) 어댑테이션셋
+
+        # PD_ = Progressive Download. 영상+음성이 합쳐진 완성된 mp4 → ffmpeg 불필요.
+        progressive = rep_id.upper().startswith("PD")
+        if not progressive:
+            codecs = rep.get("codecs") or ""
+            progressive = "avc" in codecs and "mp4a" in codecs
+        if not progressive and any(_tag(c).startswith("Segment") for c in rep):
             continue
+
+        quality = 0
+        for el in rep.iter():
+            if _tag(el) == "Label" and el.get("kind") == "resolution":
+                quality = _int(re.sub(r"[^0-9]", "", el.text or ""))
+                break
+        if not quality:
+            m = re.match(r"PD_(\d+)P", rep_id, re.I)
+            quality = int(m.group(1)) if m else _quality_from_label(rep_id)
+        if not quality:
+            width, height = _int(rep.get("width")), _int(rep.get("height"))
+            quality = min(width, height) if width and height else (height or width)
+
         url = base if base.startswith("http") else urllib.parse.urljoin(prefix, base)
-
-        rep_id = rep.get("id") or ""
-        codecs = rep.get("codecs") or ""
-        mime = rep.get("mimeType") or ""
-        try:
-            height = int(rep.get("height") or 0)
-        except (TypeError, ValueError):
-            height = 0
-        if not height:
-            for child in rep:
-                if _tag(child) == "Label" and child.get("kind") == "resolution":
-                    height = _height_from_id((child.text or "") + "p") or 0
-        height = height or _height_from_id(rep_id)
-
-        # PD_ = progressive download(완성된 단일 mp4). 영상+음성이 함께 들어있음.
-        progressive = rep_id.upper().startswith("PD") or (
-            "avc" in codecs and "mp4a" in codecs
-        )
-        if mime and "video" not in mime and not progressive:
-            continue
-        out.append({
-            "height": height,
-            "url": url,
-            "label": rep_id or f"{height}p",
-            "size": 0,
-            "progressive": progressive,
-        })
-    return out
+        out.append(_candidate(quality, url, rep_id, 0, progressive))
+    return out, drm
 
 
-def fetch_play_info(vid: str, inkey: str) -> list:
-    """재생정보 API 를 호출해 다운로드 후보 목록을 만듭니다."""
-    referer = CAFE_REFERER
+def parse_play_mpd(xml_text: str, manifest_url: str) -> tuple:
+    """네이버 DASH 매니페스트(XML) → (후보목록, DRM여부).
+
+    네임스페이스가 urn:naver:vod:2015 / :2020 등으로 바뀌어도 되도록
+    태그 이름의 로컬 파트만 보고 판단합니다.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return [], False
+    return _mpd_representations(root, manifest_url)
+
+
+def parse_play_mpd_json(data: dict, manifest_url: str) -> tuple:
+    """Accept 헤더가 무시돼 MPD 가 JSON 으로 온 경우: {"$version":.., "MPD":[..]}"""
+    out: list = []
+    drm = False
+
+    def walk(node):
+        nonlocal drm
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+            return
+        if not isinstance(node, dict):
+            return
+        if "ContentProtection" in node:
+            drm = True
+        rep_id = node.get("id")
+        base = node.get("BaseURL")
+        if isinstance(base, list):
+            base = next((b for b in base if isinstance(b, str)), None)
+        if isinstance(base, dict):
+            base = base.get("#text") or base.get("value")
+        if isinstance(rep_id, str) and isinstance(base, str) and base.strip():
+            base = base.strip()
+            if not (base.endswith("/") or base.rstrip("/").endswith("/hls")):
+                progressive = rep_id.upper().startswith("PD")
+                m = re.match(r"PD_(\d+)P", rep_id, re.I)
+                quality = int(m.group(1)) if m else _quality_from_label(rep_id)
+                if not quality:
+                    width, height = _int(node.get("width")), _int(node.get("height"))
+                    quality = min(width, height) if width and height else (height or width)
+                url = base if base.startswith("http") else urllib.parse.urljoin(manifest_url, base)
+                out.append(_candidate(quality, url, rep_id, 0, progressive))
+        for value in node.values():
+            walk(value)
+
+    walk(data.get("MPD", data))
+    return out, drm
+
+
+def play_error(body) -> str | None:
+    """재생정보 API 의 오류 본문에서 사람이 읽을 메시지를 뽑습니다.
+
+    실제 응답 예)
+      neonplayer 401: <Error code="ACCESS_DENIED"><message>호출 정보가 잘못되어 ...</message></Error>
+      rmcnmv    200: {"errorCode":"INVALID_VIDEOID","errorMessage":"호출 정보가 잘못되어 ..."}
+    """
+    if isinstance(body, (bytes, bytearray)):
+        body = body.decode("utf-8", "replace")
+    text = (body or "").strip()
+    if not text:
+        return None
+
+    if text[:1] == "<":
+        msg = re.search(r"<message>(.*?)</message>", text, re.S)
+        code = re.search(r"<Error[^>]*code=[\"']([^\"']+)", text)
+        msg = msg.group(1).strip() if msg else ""
+        code = code.group(1) if code else ""
+        if msg and code:
+            return f"{msg} ({code})"
+        return msg or code or None
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    msg = (data.get("errorMessage") or data.get("message")
+           or dig(data, "error", "message") or dig(data, "error", "msg"))
+    code = data.get("errorCode") or dig(data, "error", "code")
+    if msg and code:
+        return f"{msg} ({code})"
+    return msg or (str(code) if code else None)
+
+
+def fetch_play_info(vid: str, inkey: str, cookies: dict = None) -> list:
+    """재생정보 API 를 호출해 다운로드 후보 목록을 만듭니다.
+
+    neonplayer(DASH MPD) → 예전 rmcnmv(JSON) 순으로 시도하며,
+    응답 형식은 URL 이 아니라 본문의 첫 글자로 판별합니다.
+    """
     errors: list = []
-    candidates: list = []
+    drm_seen = False
 
-    param_sets = ({"key": inkey}, dict(PLAY_PARAMS_FULL, key=inkey))
-    for tmpl in PLAY_ENDPOINTS:
-        for params in param_sets:
-            url = tmpl.format(vid=urllib.parse.quote(vid)) + "?" + urllib.parse.urlencode(params)
+    for tmpl, accept in PLAY_ENDPOINTS:
+        base_url = tmpl.format(vid=urllib.parse.quote(vid, safe=""))
+        for extra_params in ({}, PLAY_PARAMS_EXTRA):
+            params = dict(extra_params, key=inkey)
+            url = base_url + "?" + urllib.parse.urlencode(params)
             try:
-                body, ctype, final_url = http_get(url, referer=referer, retries=2)
+                body, _ctype, final_url = http_get(
+                    url, cookies=cookies, referer=PLAY_REFERER,
+                    extra={"Accept": accept}, retries=2)
+            except HttpError as e:
+                errors.append(play_error(e.body) or f"HTTP {e.status}")
+                if e.status == 400 and not extra_params:
+                    continue            # 보조 파라미터를 붙여 한 번 더
+                break
             except Exception as e:
                 errors.append(str(e))
-                continue
+                break
 
-            text = body.decode("utf-8", "replace").lstrip("\ufeff").strip()
+            text = body.decode("utf-8", "replace").lstrip("﻿").strip()
             if not text:
-                continue
+                break
 
-            if text[:1] in "{[" or "json" in ctype.lower():
+            candidates: list = []
+            if text[:1] == "<":
+                candidates, drm = parse_play_mpd(text, final_url)
+                drm_seen = drm_seen or drm
+            elif text[:1] in "{[":
                 try:
                     data = json.loads(text)
                 except Exception:
                     data = None
                 if isinstance(data, dict):
-                    err = data.get("errorCode") or dig(data, "error", "code")
-                    if err:
-                        msg = (data.get("message") or dig(data, "error", "message") or err)
-                        errors.append(f"재생정보 오류: {msg}")
-                        continue
-                    candidates = parse_play_json(data)
-                    # JSON 안에 DASH 매니페스트만 있는 경우 한 번 더 따라갑니다.
-                    if not candidates:
-                        for stream in (data.get("streams") or []):
-                            src = (stream or {}).get("source")
-                            if isinstance(src, str) and ".mpd" in src:
-                                try:
-                                    mbody, _mct, mfinal = http_get(src, referer=referer, retries=2)
-                                    candidates = parse_play_mpd(
-                                        mbody.decode("utf-8", "replace"), mfinal)
-                                except Exception as e:
-                                    errors.append(str(e))
-                                if candidates:
-                                    break
-            elif text[:1] == "<":
-                candidates = parse_play_mpd(text, final_url)
+                    if data.get("errorCode") or dig(data, "error", "code"):
+                        errors.append(play_error(text) or "재생정보 오류")
+                        break
+                    if "MPD" in data:
+                        candidates, drm = parse_play_mpd_json(data, final_url)
+                        drm_seen = drm_seen or drm
+                    else:
+                        provider = str(dig(data, "meta", "provider", "name") or "")
+                        if provider.lower() == "drm":
+                            drm_seen = True
+                        candidates = parse_play_json(data)
+                        if not candidates:
+                            # JSON 안에 매니페스트 주소만 있는 경우 한 번 더 따라갑니다.
+                            for stream in (data.get("streams") or []):
+                                src = (stream or {}).get("source")
+                                if isinstance(src, str) and ".mpd" in src:
+                                    try:
+                                        mbody, _ct, mfinal = http_get(
+                                            src, cookies=cookies,
+                                            referer=PLAY_REFERER, retries=2)
+                                        candidates, drm = parse_play_mpd(
+                                            mbody.decode("utf-8", "replace"), mfinal)
+                                        drm_seen = drm_seen or drm
+                                    except Exception as e:
+                                        errors.append(str(e))
+                                    if candidates:
+                                        break
 
             if candidates:
                 return candidates
+            break                       # 응답은 받았으나 쓸 트랙이 없음 → 다음 엔드포인트
 
+    if drm_seen:
+        raise DrmError("DRM/유료 보호 영상이라 직접 받을 수 있는 트랙(PD)이 없습니다.")
     if errors:
-        raise RuntimeError(errors[0])
+        raise RuntimeError(f"재생정보를 가져오지 못했습니다 ({errors[0]}). "
+                           "게시글을 다시 조회하거나 쿠키를 갱신해 보세요.")
     raise RuntimeError("재생 가능한 화질을 찾지 못했습니다 (유료/DRM 영상일 수 있습니다).")
 
 
 def choose_quality(candidates: list, wanted: str):
-    """wanted: '1080' | '720' | ... | 'best' | 'worst'"""
+    """wanted: '1080' | '720' | ... | 'best' | 'worst' → (선택, 전체목록)"""
     usable = [c for c in candidates if c.get("progressive")] or candidates
     if not usable:
         return None, []
-    usable = sorted(usable, key=lambda c: (c.get("height") or 0), reverse=True)
+    usable = sorted(usable, key=lambda c: (c.get("quality") or 0), reverse=True)
 
     if wanted == "best":
         return usable[0], usable
     if wanted == "worst":
         return usable[-1], usable
 
-    try:
-        target = int(re.sub(r"[^0-9]", "", wanted) or "1080")
-    except ValueError:
-        target = 1080
+    target = _int(re.sub(r"[^0-9]", "", wanted), 1080) or 1080
 
-    exact = [c for c in usable if c.get("height") == target]
+    exact = [c for c in usable if c.get("quality") == target]
     if exact:
         return exact[0], usable
-    lower = [c for c in usable if 0 < (c.get("height") or 0) < target]
+    lower = [c for c in usable if 0 < (c.get("quality") or 0) < target]
     if lower:
         return lower[0], usable          # 요청보다 낮은 것 중 가장 높은 화질
     return usable[0], usable             # 전부 더 높으면 가장 높은 것
@@ -895,17 +1051,24 @@ def _progress(done: int, total: int, started: float) -> None:
     sys.stdout.flush()
 
 
-def download_file(url: str, dest: str, retries: int = 4) -> int:
-    """이어받기 지원 다운로드. 최종 파일 크기를 반환."""
+def download_file(url: str, dest: str, retries: int = 4, refresh=None) -> int:
+    """이어받기 지원 다운로드. 최종 파일 크기를 반환.
+
+    refresh: 서명이 만료돼 400/403 이 나올 때 새 주소를 만들어 주는 함수(선택).
+             네이버 CDN 서명(_lsu_sa_)은 약 8시간 뒤 만료됩니다.
+    """
     part = dest + ".part"
     os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
     last_err: Exception | None = None
+    refreshed = 0
 
-    for attempt in range(1, retries + 1):
+    attempt = 0
+    while attempt < retries:
+        attempt += 1
         pos = os.path.getsize(part) if os.path.exists(part) else 0
+        # CDN 은 URL 안의 서명만으로 인증합니다. 쿠키는 절대 보내지 않습니다.
         headers = {
             "User-Agent": UA,
-            "Referer": CAFE_REFERER,
             "Accept": "*/*",
             "Accept-Encoding": "identity",
             "Connection": "close",
@@ -956,6 +1119,24 @@ def download_file(url: str, dest: str, retries: int = 4) -> int:
         except KeyboardInterrupt:
             sys.stdout.write("\n")
             raise
+        except urllib.error.HTTPError as e:
+            last_err = e
+            sys.stdout.write("\n")
+            # 서명 만료 → 재생정보를 다시 받아 이어서 진행
+            if e.code in (400, 403, 410) and refresh and refreshed < 3:
+                refreshed += 1
+                attempt -= 1
+                try:
+                    fresh = refresh()
+                except Exception:
+                    fresh = None
+                if fresh:
+                    warn("다운로드 링크가 만료되어 새로 발급받았습니다.")
+                    url = fresh
+                    continue
+            if attempt < retries:
+                warn(f"다운로드 실패({attempt}/{retries}): HTTP {e.code} → 재시도합니다.")
+                time.sleep(2 * attempt)
         except Exception as e:
             last_err = e
             sys.stdout.write("\n")
@@ -1006,23 +1187,36 @@ def process_article(cafe_id: str, article_id: str, subject_hint: str,
 
     for idx, video in enumerate(videos, start=1):
         name = base if len(videos) == 1 else f"{base}_{idx}"
+
+        def resolve(_v=video):
+            """재생정보를 (다시) 받아 화질 후보를 고릅니다."""
+            return choose_quality(
+                fetch_play_info(_v["vid"], _v["inkey"], cookies), args.quality)
+
         try:
-            candidates = fetch_play_info(video["vid"], video["inkey"])
+            chosen, usable = resolve()
+        except DrmError as e:
+            warn(f"    {e}")
+            stats.failed += 1
+            continue
         except Exception as e:
             warn(f"    재생정보 실패: {e}")
             stats.failed += 1
             continue
 
-        chosen, usable = choose_quality(candidates, args.quality)
         if not chosen:
-            warn("    다운로드 가능한 화질이 없습니다.")
+            warn("    다운로드 가능한 화질이 없습니다. (DRM 이거나 분할 스트림만 존재)")
             stats.failed += 1
             continue
 
-        avail = ", ".join(f"{c['height']}p" for c in usable if c.get("height"))
-        want_h = None if args.quality in ("best", "worst") else re.sub(r"[^0-9]", "", args.quality)
-        if want_h and str(chosen.get("height")) != want_h:
-            warn(f"    {want_h}p 가 없어 {chosen.get('height')}p 로 받습니다. (가능: {avail})")
+        avail = ", ".join(f"{c['quality']}p" for c in usable if c.get("quality")) or "알 수 없음"
+        want = None if args.quality in ("best", "worst") else re.sub(r"[^0-9]", "", args.quality)
+        if want and str(chosen.get("quality")) != want:
+            if args.strict_quality:
+                warn(f"    {want}p 화질이 없어 건너뜁니다. (가능: {avail})")
+                stats.skipped += 1
+                continue
+            warn(f"    {want}p 가 없어 {chosen.get('quality')}p 로 받습니다. (가능: {avail})")
 
         target = os.path.join(args.outdir, sanitize_filename(name) + ".mp4")
         if os.path.exists(target) and not args.overwrite:
@@ -1031,14 +1225,20 @@ def process_article(cafe_id: str, article_id: str, subject_hint: str,
             continue
 
         size_hint = f" ({human(chosen['size'])})" if chosen.get("size") else ""
-        log(f"    {chosen.get('height') or '?'}p [{chosen['label']}]{size_hint} → {os.path.basename(target)}")
+        log(f"    {chosen.get('quality') or '?'}p [{chosen['label']}]{size_hint}"
+            f" → {os.path.basename(target)}")
 
         if args.list_only:
             stats.skipped += 1
             continue
 
+        def refresh():
+            """CDN 서명이 만료됐을 때 새 주소를 발급."""
+            again, _ = resolve()
+            return again["url"] if again else None
+
         try:
-            written = download_file(chosen["url"], target)
+            written = download_file(chosen["url"], target, refresh=refresh)
             log(f"    완료: {human(written)}")
             stats.ok += 1
         except KeyboardInterrupt:
@@ -1082,8 +1282,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="원하는 화질: 1080 / 720 / 480 / best / worst (기본: 1080)")
     p.add_argument("-c", "--cookies", help="쿠키 파일 경로 (기본: 스크립트 옆 cookies.txt)")
     p.add_argument("--pages", type=int, default=10, help="게시판 모드에서 읽을 목록 페이지 수 (기본: 10)")
-    p.add_argument("--per-page", type=int, default=50, help="목록 페이지당 글 수 (기본: 50)")
+    p.add_argument("--per-page", type=int, default=50,
+                   help="목록 페이지당 글 수 (최대 50, 기본: 50)")
     p.add_argument("--limit", type=int, default=0, help="최대 처리할 게시글 수 (0 = 제한 없음)")
+    p.add_argument("--strict-quality", action="store_true",
+                   help="요청한 화질이 없으면 낮은 화질로 받지 않고 건너뛰기")
+    p.add_argument("--all-articles", action="store_true",
+                   help="목록의 '동영상 있음' 표시를 무시하고 모든 글을 열어보기")
     p.add_argument("--oldest-first", action="store_true", help="오래된 글부터 처리")
     p.add_argument("--skip-notice", action="store_true", help="공지글 건너뛰기")
     p.add_argument("--full-title", action="store_true",
@@ -1101,6 +1306,7 @@ def main(argv=None) -> int:
     init_console()
     args = build_parser().parse_args(argv)
     args.quality = (args.quality or "1080").strip().lower()
+    args.per_page = max(1, min(args.per_page, 50))   # 목록 API 상한이 50 (초과 시 15로 떨어짐)
 
     url = args.url or interactive_url()
     cookies = load_cookies(args.cookies)
@@ -1121,6 +1327,13 @@ def main(argv=None) -> int:
                 target["cafe_id"], target["menu_id"], cookies, args.pages, args.per_page)
             if args.skip_notice:
                 articles = [a for a in articles if not a["notice"]]
+            # 목록이 '동영상 있음'을 알려주면 그 글만 열어봅니다 (본문 조회 횟수를 크게 줄임)
+            if not args.all_articles and any(a["movie_flag_known"] for a in articles):
+                with_movie = [a for a in articles if a["has_movie"]]
+                if with_movie:
+                    info(f"동영상이 있는 글만 처리합니다: {len(with_movie)}/{len(articles)}개"
+                         " (전부 확인하려면 --all-articles)")
+                    articles = with_movie
             if args.oldest_first:
                 articles = list(reversed(articles))
             if args.limit > 0:
