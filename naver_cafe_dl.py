@@ -25,8 +25,10 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import zlib
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -85,6 +87,12 @@ PLAY_PARAMS_EXTRA = {"env": "real", "lc": "ko_KR", "cpl": "ko_KR"}
 # --------------------------------------------------------------------------- #
 # 출력 유틸
 # --------------------------------------------------------------------------- #
+
+
+# 여러 스레드가 동시에 출력해도 줄이 섞이지 않도록
+PRINT_LOCK = threading.RLock()
+# Ctrl+C 등으로 전체 중단을 알리는 신호 (다운로드 루프가 매 청크마다 확인)
+ABORT = threading.Event()
 
 
 def init_console() -> None:
@@ -1051,12 +1059,16 @@ def _progress(done: int, total: int, started: float) -> None:
     sys.stdout.flush()
 
 
-def download_file(url: str, dest: str, retries: int = 4, refresh=None) -> int:
+def download_file(url: str, dest: str, retries: int = 4, refresh=None,
+                  show_progress: bool = True, say=None) -> int:
     """이어받기 지원 다운로드. 최종 파일 크기를 반환.
 
-    refresh: 서명이 만료돼 400/403 이 나올 때 새 주소를 만들어 주는 함수(선택).
-             네이버 CDN 서명(_lsu_sa_)은 약 8시간 뒤 만료됩니다.
+    refresh:       서명이 만료돼 400/403 이 나올 때 새 주소를 만들어 주는 함수(선택).
+                   네이버 CDN 서명(_lsu_sa_)은 약 8시간 뒤 만료됩니다.
+    show_progress: 진행률 바 표시 여부 (병렬 모드에서는 줄이 겹치므로 끕니다).
+    say:           메시지 출력 함수 (병렬 모드에서 글 번호를 붙이기 위해).
     """
+    say = say or (lambda msg: warn(msg))
     part = dest + ".part"
     os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
     last_err: Exception | None = None
@@ -1097,18 +1109,22 @@ def download_file(url: str, dest: str, retries: int = 4, refresh=None) -> int:
                 last_draw = 0.0
                 with open(part, mode) as f:
                     while True:
+                        if ABORT.is_set():
+                            raise KeyboardInterrupt
                         chunk = resp.read(CHUNK)
                         if not chunk:
                             break
                         f.write(chunk)
                         done += len(chunk)
                         now = time.time()
-                        if now - last_draw > 0.2:
+                        if show_progress and now - last_draw > 0.2:
                             _progress(done, total, started)
                             last_draw = now
-                _progress(done, total, started)
-                sys.stdout.write("\n")
-                sys.stdout.flush()
+                if show_progress:
+                    _progress(done, total, started)
+                    if sys.stdout.isatty():
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
 
             if total and os.path.getsize(part) < total:
                 raise IOError(f"전송이 중간에 끊겼습니다 ({human(os.path.getsize(part))}/{human(total)})")
@@ -1117,11 +1133,9 @@ def download_file(url: str, dest: str, retries: int = 4, refresh=None) -> int:
             return os.path.getsize(dest)
 
         except KeyboardInterrupt:
-            sys.stdout.write("\n")
             raise
         except urllib.error.HTTPError as e:
             last_err = e
-            sys.stdout.write("\n")
             # 서명 만료 → 재생정보를 다시 받아 이어서 진행
             if e.code in (400, 403, 410) and refresh and refreshed < 3:
                 refreshed += 1
@@ -1131,17 +1145,16 @@ def download_file(url: str, dest: str, retries: int = 4, refresh=None) -> int:
                 except Exception:
                     fresh = None
                 if fresh:
-                    warn("다운로드 링크가 만료되어 새로 발급받았습니다.")
+                    say("다운로드 링크가 만료되어 새로 발급받았습니다.")
                     url = fresh
                     continue
             if attempt < retries:
-                warn(f"다운로드 실패({attempt}/{retries}): HTTP {e.code} → 재시도합니다.")
+                say(f"다운로드 실패({attempt}/{retries}): HTTP {e.code} → 재시도합니다.")
                 time.sleep(2 * attempt)
         except Exception as e:
             last_err = e
-            sys.stdout.write("\n")
             if attempt < retries:
-                warn(f"다운로드 실패({attempt}/{retries}): {e} → 재시도합니다.")
+                say(f"다운로드 실패({attempt}/{retries}): {e} → 재시도합니다.")
                 time.sleep(2 * attempt)
 
     raise RuntimeError(f"다운로드 실패: {last_err}")
@@ -1153,33 +1166,68 @@ def download_file(url: str, dest: str, retries: int = 4, refresh=None) -> int:
 
 
 class Stats:
+    """여러 스레드가 함께 증가시키므로 락으로 보호합니다."""
+
+    FIELDS = ("ok", "skipped", "failed", "no_video", "listed")
+
     def __init__(self):
-        self.ok = 0
-        self.skipped = 0
-        self.failed = 0
-        self.no_video = 0
-        self.listed = 0      # --list 모드에서 확인만 한 영상 수
+        self._lock = threading.Lock()
+        for name in self.FIELDS:
+            setattr(self, name, 0)
+
+    def bump(self, field: str) -> None:
+        with self._lock:
+            setattr(self, field, getattr(self, field) + 1)
+
+
+# 서로 다른 글의 제목이 같으면 같은 파일명이 나옵니다.
+# 두 스레드가 동시에 같은 .part 에 쓰지 않도록 미리 예약합니다.
+_CLAIM_LOCK = threading.Lock()
+_CLAIMED: set = set()
+
+
+def claim_target(path: str) -> bool:
+    with _CLAIM_LOCK:
+        if path in _CLAIMED:
+            return False
+        _CLAIMED.add(path)
+        return True
+
+
+def release_target(path: str) -> None:
+    with _CLAIM_LOCK:
+        _CLAIMED.discard(path)
 
 
 def process_article(cafe_id: str, article_id: str, subject_hint: str,
-                    cookies: dict, args, stats: Stats) -> None:
+                    cookies: dict, args, stats: Stats,
+                    tag: str = "", show_progress: bool = True) -> None:
+    """tag 가 있으면 병렬 모드 - 모든 줄 앞에 [n/N] 을 붙이고 진행률 바는 끕니다."""
+    indent = "" if tag else "    "
+
+    def say(msg: str = "") -> None:
+        with PRINT_LOCK:
+            print((tag + msg) if msg else "", flush=True)
+
+    if not tag:
+        say()                      # 순차 모드에서는 글마다 빈 줄로 구분
+
     try:
         article = fetch_article(cafe_id, article_id, cookies)
     except AuthError:
         raise
     except Exception as e:
-        warn(f"[{article_id}] 게시글 읽기 실패: {e}")
-        stats.failed += 1
+        say(f"[!] [{article_id}] 게시글 읽기 실패: {e}")
+        stats.bump("failed")
         return
 
     subject = article["subject"] or subject_hint or f"article_{article_id}"
     videos = extract_videos(article["html"])
 
-    log("")
-    log(f"── [{article_id}] {subject}")
+    say(("── " if not tag else "") + f"[{article_id}] {subject}")
     if not videos:
-        log("    동영상이 없습니다. 건너뜁니다.")
-        stats.no_video += 1
+        say(f"{indent}동영상이 없습니다. 건너뜁니다.")
+        stats.bump("no_video")
         return
 
     base = title_to_basename(subject, args.full_title)
@@ -1194,43 +1242,52 @@ def process_article(cafe_id: str, article_id: str, subject_hint: str,
             return choose_quality(
                 fetch_play_info(_v["vid"], _v["inkey"], cookies), args.quality)
 
+        if ABORT.is_set():
+            return
+
         try:
             chosen, usable = resolve()
         except DrmError as e:
-            warn(f"    {e}")
-            stats.failed += 1
+            say(f"{indent}[!] {e}")
+            stats.bump("failed")
             continue
         except Exception as e:
-            warn(f"    재생정보 실패: {e}")
-            stats.failed += 1
+            say(f"{indent}[!] 재생정보 실패: {e}")
+            stats.bump("failed")
             continue
 
         if not chosen:
-            warn("    다운로드 가능한 화질이 없습니다. (DRM 이거나 분할 스트림만 존재)")
-            stats.failed += 1
+            say(f"{indent}[!] 다운로드 가능한 화질이 없습니다. (DRM 이거나 분할 스트림만 존재)")
+            stats.bump("failed")
             continue
 
         avail = ", ".join(f"{c['quality']}p" for c in usable if c.get("quality")) or "알 수 없음"
         want = None if args.quality in ("best", "worst") else re.sub(r"[^0-9]", "", args.quality)
         if want and str(chosen.get("quality")) != want:
             if args.strict_quality:
-                warn(f"    {want}p 화질이 없어 건너뜁니다. (가능: {avail})")
-                stats.skipped += 1
+                say(f"{indent}[!] {want}p 화질이 없어 건너뜁니다. (가능: {avail})")
+                stats.bump("skipped")
                 continue
-            warn(f"    {want}p 가 없어 {chosen.get('quality')}p 로 받습니다. (가능: {avail})")
+            say(f"{indent}[!] {want}p 가 없어 {chosen.get('quality')}p 로 받습니다. (가능: {avail})")
 
         target = os.path.join(args.outdir, sanitize_filename(name) + ".mp4")
         if os.path.exists(target) and not args.overwrite:
-            log(f"    이미 있음 → 건너뜀: {os.path.basename(target)}")
-            stats.skipped += 1
+            say(f"{indent}이미 있음 → 건너뜀: {os.path.basename(target)}")
+            stats.bump("skipped")
             continue
 
         size_hint = f" ({human(chosen['size'])})" if chosen.get("size") else ""
-        log(f"    {chosen.get('quality') or '?'}p [{chosen['label']}]{size_hint}"
+        say(f"{indent}{chosen.get('quality') or '?'}p [{chosen['label']}]{size_hint}"
             f" → {os.path.basename(target)}")
 
         if args.list_only:
-            stats.listed += 1
+            stats.bump("listed")
+            continue
+
+        if not claim_target(target):
+            say(f"{indent}[!] 같은 이름을 다른 글이 받는 중이라 건너뜁니다"
+                f": {os.path.basename(target)}  (--prefix-id 를 쓰면 겹치지 않습니다)")
+            stats.bump("skipped")
             continue
 
         def refresh():
@@ -1238,18 +1295,70 @@ def process_article(cafe_id: str, article_id: str, subject_hint: str,
             again, _ = resolve()
             return again["url"] if again else None
 
+        began = time.time()
         try:
-            written = download_file(chosen["url"], target, refresh=refresh)
-            log(f"    완료: {human(written)}")
-            stats.ok += 1
+            written = download_file(
+                chosen["url"], target, refresh=refresh,
+                show_progress=show_progress,
+                say=lambda m: say(f"{indent}[!] {m}"))
+            say(f"{indent}완료: {os.path.basename(target)}"
+                f"  {human(written)}  {time.time() - began:.0f}초")
+            stats.bump("ok")
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            warn(f"    {e}")
-            stats.failed += 1
+            say(f"{indent}[!] {e}")
+            stats.bump("failed")
+        finally:
+            release_target(target)
 
-        if args.sleep > 0:
+        if args.sleep > 0 and not ABORT.is_set():
             time.sleep(args.sleep)
+
+
+def run_articles(cafe_id: str, articles: list, cookies: dict, args,
+                 stats: Stats, jobs: int) -> None:
+    """게시글 목록을 순차 또는 병렬로 처리합니다."""
+    total = len(articles)
+    width = len(str(total))
+
+    if jobs <= 1:
+        for article in articles:
+            process_article(cafe_id, article["article_id"], article["subject"],
+                            cookies, args, stats)
+        return
+
+    fatal: list = []
+
+    def worker(index: int, article: dict) -> None:
+        if ABORT.is_set():
+            return
+        try:
+            process_article(cafe_id, article["article_id"], article["subject"],
+                            cookies, args, stats,
+                            tag=f"[{index:>{width}}/{total}] ", show_progress=False)
+        except AuthError as e:
+            # 쿠키가 죽었으면 나머지를 계속 시도해도 의미가 없습니다.
+            ABORT.set()
+            fatal.append(e)
+        except KeyboardInterrupt:
+            ABORT.set()
+
+    executor = ThreadPoolExecutor(max_workers=jobs)
+    futures = [executor.submit(worker, i, a) for i, a in enumerate(articles, start=1)]
+    try:
+        wait(futures, return_when=FIRST_EXCEPTION)
+    except KeyboardInterrupt:
+        ABORT.set()
+        raise
+    finally:
+        if ABORT.is_set():
+            for future in futures:
+                future.cancel()
+        executor.shutdown(wait=True)
+
+    if fatal:
+        raise fatal[0]
 
 
 def interactive_url() -> str:
@@ -1282,6 +1391,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-q", "--quality", default="1080",
                    help="원하는 화질: 1080 / 720 / 480 / best / worst (기본: 1080)")
     p.add_argument("-c", "--cookies", help="쿠키 파일 경로 (기본: 스크립트 옆 cookies.txt)")
+    p.add_argument("-j", "--jobs", type=int, default=3,
+                   help="동시에 받을 개수 1~8 (기본: 3). 1 이면 진행률 바가 나옵니다")
     p.add_argument("--pages", type=int, default=10, help="게시판 모드에서 읽을 목록 페이지 수 (기본: 10)")
     p.add_argument("--per-page", type=int, default=50,
                    help="목록 페이지당 글 수 (최대 50, 기본: 50)")
@@ -1308,6 +1419,7 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     args.quality = (args.quality or "1080").strip().lower()
     args.per_page = max(1, min(args.per_page, 50))   # 목록 API 상한이 50 (초과 시 15로 떨어짐)
+    args.jobs = max(1, min(args.jobs, 8))            # 서버에 무리가 가지 않도록 상한
 
     url = args.url or interactive_url()
     cookies = load_cookies(args.cookies)
@@ -1341,10 +1453,11 @@ def main(argv=None) -> int:
                 articles = articles[: args.limit]
             if not articles:
                 die("게시글을 찾지 못했습니다. 게시판 주소와 접근 권한을 확인해 주세요.")
-            info(f"총 {len(articles)}개 게시글을 처리합니다.")
-            for article in articles:
-                process_article(target["cafe_id"], article["article_id"],
-                                article["subject"], cookies, args, stats)
+
+            jobs = 1 if (args.list_only or len(articles) == 1) else args.jobs
+            info(f"총 {len(articles)}개 게시글을 처리합니다."
+                 + (f" (동시 {jobs}개)" if jobs > 1 else ""))
+            run_articles(target["cafe_id"], articles, cookies, args, stats, jobs)
     except KeyboardInterrupt:
         log("")
         warn("사용자가 중단했습니다. (.part 파일이 남아 있으면 다시 실행 시 이어받습니다)")
