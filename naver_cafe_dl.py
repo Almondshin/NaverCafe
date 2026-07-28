@@ -48,6 +48,7 @@ CAFE_REFERER = "https://cafe.naver.com/"
 COOKIE_KEYS = ("NID_AUT", "NID_JST", "NID_SES")
 DEFAULT_OUTDIR = "downloads"
 CHUNK = 256 * 1024
+MAX_JOBS = 8
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 게시글 본문 API (우선순위 순서대로 시도. v2 는 500 을 반환하므로 제외)
@@ -1392,7 +1393,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="원하는 화질: 1080 / 720 / 480 / best / worst (기본: 1080)")
     p.add_argument("-c", "--cookies", help="쿠키 파일 경로 (기본: 스크립트 옆 cookies.txt)")
     p.add_argument("-j", "--jobs", type=int, default=3,
-                   help="동시에 받을 개수 1~8 (기본: 3). 1 이면 진행률 바가 나옵니다")
+                   help=f"동시에 받을 개수 1~{MAX_JOBS} (기본: 3). 1 이면 진행률 바가 나옵니다."
+                        " 받을 '개수'는 --limit 로 정합니다")
     p.add_argument("--pages", type=int, default=10, help="게시판 모드에서 읽을 목록 페이지 수 (기본: 10)")
     p.add_argument("--per-page", type=int, default=50,
                    help="목록 페이지당 글 수 (최대 50, 기본: 50)")
@@ -1419,7 +1421,15 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     args.quality = (args.quality or "1080").strip().lower()
     args.per_page = max(1, min(args.per_page, 50))   # 목록 API 상한이 50 (초과 시 15로 떨어짐)
-    args.jobs = max(1, min(args.jobs, 8))            # 서버에 무리가 가지 않도록 상한
+
+    requested_jobs = args.jobs
+    args.jobs = max(1, min(args.jobs, MAX_JOBS))
+    if requested_jobs != args.jobs:
+        warn(f"--jobs {requested_jobs} → {args.jobs} 로 조정했습니다 (허용 범위 1~{MAX_JOBS}).\n"
+             "    큰 파일은 동시 개수가 아니라 회선 대역폭이 병목이라,"
+             " 더 늘려도 총 시간은 거의 같고 차단 위험만 커집니다.\n"
+             "    받을 개수는 --jobs 가 아니라 --limit 이 정합니다"
+             " (--limit 를 안 쓰면 전체).")
 
     url = args.url or interactive_url()
     cookies = load_cookies(args.cookies)
